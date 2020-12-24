@@ -46,7 +46,21 @@ roleRef:
   name: elasticsearch-logging
   apiGroup: ""
 ---
-# Elasticsearch deployment itself
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elasticsearch-logging
+data:
+  elasticsearch.yml: |
+    cluster.name: my-elastic-cluster
+    network.host: "0.0.0.0"
+    bootstrap.memory_lock: false
+    discovery.zen.ping.unicast.hosts: elasticsearch-logging
+    discovery.zen.minimum_master_nodes: 1
+    xpack.security.enabled: false
+    xpack.monitoring.enabled: false
+  ES_JAVA_OPTS: -Xms512m -Xmx512m
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -59,7 +73,7 @@ metadata:
     addonmanager.kubernetes.io/mode: Reconcile
 spec:
   serviceName: elasticsearch-logging
-  replicas: 3
+  replicas: 2
   updateStrategy:
     type: RollingUpdate
   selector:
@@ -74,24 +88,40 @@ spec:
         kubernetes.io/cluster-service: "true"
     spec:
       serviceAccountName: elasticsearch-logging
-      # Elasticsearch requires vm.max_map_count to be at least 262144.
-      # If your OS already sets up this number to a higher value, feel free
-      # to remove this init container.
+      securityContext:
+        fsGroup: 1000
       initContainers:
-      - image: alpine:3.7
-        command: ["/sbin/sysctl", "-w", "vm.max_map_count=262144"]
-        name: elasticsearch-logging-init
+      - name: elasticsearch-logging-init
+        image: busybox
+        imagePullPolicy: IfNotPresent
         securityContext:
           privileged: true
+        command: ["sysctl", "-w", "vm.max_map_count=262144"]
       containers:
-      - image: docker.elastic.co/elasticsearch/elasticsearch:7.10.1
-        name: elasticsearch-logging
+      - name: elasticsearch-logging
         resources:
-          # need more cpu upon initialization, therefore burstable class
-          limits:
-            cpu: 1000m
-          requests:
-            cpu: 100m
+            requests:
+                memory: 1Gi
+        securityContext:
+          privileged: true
+          runAsUser: 1000
+          capabilities:
+            add:
+            - IPC_LOCK
+            - SYS_RESOURCE
+        image: docker.elastic.co/elasticsearch/elasticsearch:7.10.1
+        env:
+        - name: ES_JAVA_OPTS
+          valueFrom:
+              configMapKeyRef:
+                  name: elasticsearch-logging
+                  key: ES_JAVA_OPTS
+        readinessProbe:
+          httpGet:
+            scheme: HTTP
+            path: /_cluster/health?local=true
+            port: 9200
+          initialDelaySeconds: 5
         ports:
         - containerPort: 9200
           name: db
@@ -101,18 +131,22 @@ spec:
           protocol: TCP
         volumeMounts:
         - name: elasticsearch-logging
-          mountPath: /data
-        env:
-        - name: "NAMESPACE"
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
+          mountPath: /usr/share/elasticsearch/data
+        - name: elasticsearch-config
+          mountPath: /usr/share/elasticsearch/config/elasticsearch.yml
+          subPath: elasticsearch.yml
+      volumes:
+        - name: elasticsearch-config
+          configMap:
+            name: elasticsearch-logging
+            items:
+              - key: elasticsearch.yml
+                path: elasticsearch.yml
   volumeClaimTemplates:
   - metadata:
       name: elasticsearch-logging
     spec:
       accessModes: [ "ReadWriteOnce" ]
-      storageClassName: default
       resources:
         requests:
           storage: 5Gi
